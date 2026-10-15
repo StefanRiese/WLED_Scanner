@@ -80,5 +80,15 @@ cargo clippy --all-targets -- -D warnings
 
 GitHub Actions (`.github/workflows/ci.yml`) checks formatting and Clippy, runs the tests and
 builds the app on Windows, Linux and macOS for every push (all branches) and pull request.
-The packaged builds are attached to each run as artifacts. Pushing a tag like `v1.0.0`
-creates a GitHub release with these files.
+The packaged builds are attached to each run as artifacts.
+
+To publish a release:
+
+1. Add a `## vX.Y.Z – YYYY-MM-DD` section to [`CHANGELOG.md`](CHANGELOG.md) and bump
+   `version` in `wled-scanner-rs/Cargo.toml`.
+2. Commit, then tag and push: `git tag -a vX.Y.Z -m "WLED Scanner vX.Y.Z" && git push origin main vX.Y.Z`
+
+The CI then creates the GitHub release with the three packages. The release note is the
+version's changelog section plus the download table from `.github/release-notes-footer.md`
+(preview it with `.github/scripts/release-notes.sh vX.Y.Z`). A tag without a changelog
+section fails the CI before anything is published.
