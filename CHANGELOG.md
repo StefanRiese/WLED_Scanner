@@ -3,6 +3,14 @@
 The section for a version becomes its GitHub release note (see `.github/scripts/release-notes.sh`).
 Add a `## vX.Y.Z – YYYY-MM-DD` section before pushing the tag.
 
+## Unreleased
+
+### What's new
+- **mDNS discovery.** Devices are now also found via mDNS (`_wled._tcp`), so they show up even when *Discover nodes* is switched off in WLED.
+- **Regular polling.** Every known device is queried every 30 seconds, so devices without UDP broadcasts stay up to date and offline devices are detected reliably.
+- *Clear list* restarts the mDNS search, so devices found via mDNS come back right away.
+- The macOS app bundle explains why it needs local network access (macOS 15 and later).
+
 ## v1.1.0 – 2026-10-15
 
 The device list now stays up to date while the scanner is running.

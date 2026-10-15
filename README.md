@@ -5,15 +5,20 @@
 
 Finds [WLED](https://kno.wled.ge) devices on your local network. Runs on Windows, Linux and macOS.
 
-The scanner listens on UDP port **65506** for the node announcements WLED devices broadcast
-(every 30 seconds), queries each device via `http://<ip>/json/info` and lists its name, IP,
-version, architecture, uptime and when it was last seen. Every announcement refreshes the
-device's data; devices that stop announcing themselves for more than 90 seconds stay in the
-list, greyed out. Select a device and click **Open in browser** (or double-click it) to open
-its web UI.
+The scanner finds devices in two ways:
 
-> Devices only announce themselves if *Config → WiFi Setup / Sync Interfaces → Discover nodes*
-> (UDP node broadcast) is enabled in WLED. Make sure your firewall allows incoming UDP on port 65506.
+- **mDNS** – every WLED device advertises the service `_wled._tcp`, so it is found without any
+  configuration.
+- **UDP broadcasts** on port **65506** – sent every 30 seconds by devices that have
+  *Config → WiFi Setup / Sync Interfaces → Discover nodes* enabled.
+
+Each device is queried via `http://<ip>/json/info` every 30 seconds; the list shows its name,
+IP, version, architecture, uptime and when it was last seen. Devices that haven't answered or
+announced themselves for more than 90 seconds stay in the list, greyed out. Select a device
+and click **Open in browser** (or double-click it) to open its web UI.
+
+> Your firewall must allow incoming UDP on ports 5353 (mDNS) and 65506. On macOS 15 and later,
+> allow the "local network" access the app asks for on first start.
 
 ## Download
 

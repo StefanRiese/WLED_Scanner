@@ -1,7 +1,7 @@
 // Hide the console window on Windows release builds.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -9,13 +9,20 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
+use mdns_sd::{ServiceDaemon, ServiceEvent};
 use serde::Deserialize;
 use socket2::{Domain, Protocol, Socket, Type};
 
 /// UDP port WLED uses to broadcast node info ("Discover nodes").
 const DISCOVERY_PORT: u16 = 65506;
+/// mDNS service every WLED device advertises, independent of "Discover nodes".
+const MDNS_SERVICE: &str = "_wled._tcp.local.";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
-/// WLED broadcasts every 30 s; after three missed broadcasts a device counts as offline.
+/// Every known device is queried this often (matches WLED's 30 s broadcast interval).
+const POLL_INTERVAL: Duration = Duration::from_secs(30);
+/// Skip a request if the device was queried this recently (broadcast and poll coinciding).
+const MIN_REQUEST_GAP: Duration = Duration::from_secs(5);
+/// A device that has not answered or announced itself for three intervals counts as offline.
 const OFFLINE_AFTER: Duration = Duration::from_secs(90);
 
 /// Subset of WLED's `/json/info` response that the scanner displays.
@@ -30,7 +37,7 @@ struct WledInfo {
 }
 
 struct Device {
-    /// Address from the discovery packet; identifies the device.
+    /// Address from the UDP announcement or mDNS; identifies the device.
     announced_ip: Ipv4Addr,
     name: String,
     ip: String,
@@ -73,7 +80,7 @@ impl Device {
 }
 
 enum Event {
-    /// A discovery packet announced this IP.
+    /// A UDP announcement or mDNS lookup reported this IP.
     Announced(Ipv4Addr),
     /// `/json/info` for an IP was fetched (or failed). Tagged with the list generation.
     Info(u64, Ipv4Addr, Option<WledInfo>),
@@ -84,8 +91,11 @@ struct App {
     rx: Receiver<Event>,
     ctx: egui::Context,
     devices: Vec<Device>,
+    /// Every discovered IP (listed or not) with the time of its last `/json/info` request.
+    known: HashMap<Ipv4Addr, Instant>,
     /// IPs whose `/json/info` request is still running.
     pending: HashSet<Ipv4Addr>,
+    mdns: Option<ServiceDaemon>,
     /// Bumped on "Clear list" so late HTTP results from before the clear are dropped.
     generation: u64,
     selected: Option<usize>,
@@ -97,21 +107,30 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let ctx = cc.egui_ctx.clone();
 
-        let status = match bind_discovery_socket() {
+        let udp_status = match bind_discovery_socket() {
             Ok(socket) => {
                 let (tx, ctx) = (tx.clone(), ctx.clone());
                 thread::spawn(move || listen(socket, tx, ctx));
-                format!("Listening for WLED devices on UDP port {DISCOVERY_PORT}…")
+                format!("UDP port {DISCOVERY_PORT}")
             }
-            Err(e) => format!("Could not bind UDP port {DISCOVERY_PORT}: {e}"),
+            Err(e) => format!("UDP port {DISCOVERY_PORT} unavailable: {e}"),
         };
+        let mdns = ServiceDaemon::new()
+            .and_then(|daemon| browse_mdns(&daemon, tx.clone(), ctx.clone()).map(|()| daemon));
+        let mdns_status = match &mdns {
+            Ok(_) => "mDNS".to_owned(),
+            Err(e) => format!("mDNS unavailable: {e}"),
+        };
+        let status = format!("Listening for WLED devices ({udp_status}, {mdns_status})…");
 
         Self {
             tx,
             rx,
             ctx,
             devices: Vec::new(),
+            known: HashMap::new(),
             pending: HashSet::new(),
+            mdns: mdns.ok(),
             generation: 0,
             selected: None,
             status,
@@ -122,25 +141,24 @@ impl App {
         while let Ok(event) = self.rx.try_recv() {
             match event {
                 Event::Announced(ip) => {
-                    // The broadcast itself proves the device is online.
+                    let now = Instant::now();
+                    // The announcement itself proves the device is online.
                     if let Some(device) = self.device_mut(ip) {
-                        device.last_seen = Instant::now();
+                        device.last_seen = now;
                     }
-                    // Refresh name, version and uptime on every announcement.
-                    if self.pending.insert(ip) {
-                        let (tx, ctx, generation) =
-                            (self.tx.clone(), self.ctx.clone(), self.generation);
-                        thread::spawn(move || {
-                            let info = fetch_info(ip);
-                            let _ = tx.send(Event::Info(generation, ip, info));
-                            ctx.request_repaint();
-                        });
+                    // Refresh name, version and uptime unless a request just went out.
+                    let recently = self
+                        .known
+                        .get(&ip)
+                        .is_some_and(|last| now.duration_since(*last) < MIN_REQUEST_GAP);
+                    if !recently {
+                        self.request_info(ip, now);
                     }
                 }
                 Event::Info(generation, _, _) if generation != self.generation => {}
                 Event::Info(_, ip, info) => {
                     self.pending.remove(&ip);
-                    // A failed lookup keeps the previous data; the next announcement retries.
+                    // A failed lookup keeps the previous data; the next poll retries.
                     let Some(info) = info else { continue };
                     let now = Instant::now();
                     match self.device_mut(ip) {
@@ -165,13 +183,40 @@ impl App {
         }
     }
 
+    /// Queries every known device whose last request is older than [`POLL_INTERVAL`].
+    /// This keeps devices found only via mDNS (no broadcasts) up to date.
+    fn poll_devices(&mut self, now: Instant) {
+        for ip in due_for_poll(&self.known, now) {
+            self.request_info(ip, now);
+        }
+    }
+
+    fn request_info(&mut self, ip: Ipv4Addr, now: Instant) {
+        self.known.insert(ip, now);
+        if !self.pending.insert(ip) {
+            return;
+        }
+        let (tx, ctx, generation) = (self.tx.clone(), self.ctx.clone(), self.generation);
+        thread::spawn(move || {
+            let info = fetch_info(ip);
+            let _ = tx.send(Event::Info(generation, ip, info));
+            ctx.request_repaint();
+        });
+    }
+
     fn device_mut(&mut self, ip: Ipv4Addr) -> Option<&mut Device> {
         self.devices.iter_mut().find(|d| d.announced_ip == ip)
     }
 
     fn clear(&mut self) {
         self.devices.clear();
+        self.known.clear();
         self.pending.clear();
+        // mDNS devices don't re-announce themselves, so search again to rediscover them.
+        if let Some(daemon) = &self.mdns {
+            let _ = daemon.stop_browse(MDNS_SERVICE);
+            let _ = browse_mdns(daemon, self.tx.clone(), self.ctx.clone());
+        }
         self.selected = None;
         self.generation += 1;
     }
@@ -189,6 +234,7 @@ impl eframe::App for App {
         // Keep "Last seen" and uptime ticking without new events.
         ui.ctx().request_repaint_after(Duration::from_secs(1));
         let now = Instant::now();
+        self.poll_devices(now);
 
         egui::Panel::bottom("buttons").show(ui, |ui| {
             ui.add_space(6.0);
@@ -301,6 +347,38 @@ fn listen(socket: UdpSocket, tx: Sender<Event>, ctx: egui::Context) {
             ctx.request_repaint();
         }
     }
+}
+
+/// IPs whose last `/json/info` request is at least [`POLL_INTERVAL`] old.
+fn due_for_poll(known: &HashMap<Ipv4Addr, Instant>, now: Instant) -> Vec<Ipv4Addr> {
+    known
+        .iter()
+        .filter(|(_, last)| now.duration_since(**last) >= POLL_INTERVAL)
+        .map(|(ip, _)| *ip)
+        .collect()
+}
+
+/// Browses for WLED's mDNS service and reports each resolved IPv4 address.
+fn browse_mdns(
+    daemon: &ServiceDaemon,
+    tx: Sender<Event>,
+    ctx: egui::Context,
+) -> mdns_sd::Result<()> {
+    let events = daemon.browse(MDNS_SERVICE)?;
+    thread::spawn(move || {
+        // Ends when the browse is stopped (Clear list) and the daemon drops the sender.
+        while let Ok(event) = events.recv() {
+            if let ServiceEvent::ServiceResolved(service) = event {
+                for ip in service.get_addresses_v4() {
+                    if tx.send(Event::Announced(ip)).is_err() {
+                        return;
+                    }
+                }
+                ctx.request_repaint();
+            }
+        }
+    });
+    Ok(())
 }
 
 /// WLED node-info packet: byte 0 = 255 (token), byte 1 = 1 (node info), bytes 2..6 = IPv4 address.
@@ -417,6 +495,18 @@ mod tests {
         let d = device(20, 20, now);
         assert!(!d.is_offline(now));
         assert_eq!(d.current_uptime(now), 1020);
+    }
+
+    #[test]
+    fn polls_only_devices_not_queried_recently() {
+        let now = Instant::now();
+        let fresh = Ipv4Addr::new(10, 0, 0, 1);
+        let stale = Ipv4Addr::new(10, 0, 0, 2);
+        let known = HashMap::from([
+            (fresh, now - Duration::from_secs(10)),
+            (stale, now - Duration::from_secs(31)),
+        ]);
+        assert_eq!(due_for_poll(&known, now), vec![stale]);
     }
 
     #[test]

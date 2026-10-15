@@ -39,6 +39,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleVersion</key><string>$VERSION</string>
     <key>LSMinimumSystemVersion</key><string>10.13</string>
     <key>NSHighResolutionCapable</key><true/>
+    <key>NSLocalNetworkUsageDescription</key><string>WLED Scanner listens for WLED devices on your local network (UDP broadcasts and mDNS).</string>
 </dict>
 </plist>
 PLIST
