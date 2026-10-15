@@ -3,7 +3,7 @@
 The section for a version becomes its GitHub release note (see `.github/scripts/release-notes.sh`).
 Add a `## vX.Y.Z – YYYY-MM-DD` section before pushing the tag.
 
-## Unreleased
+## v1.2.0 – 2026-10-15
 
 ### What's new
 - **mDNS discovery.** Devices are now also found via mDNS (`_wled._tcp`), so they show up even when *Discover nodes* is switched off in WLED.
