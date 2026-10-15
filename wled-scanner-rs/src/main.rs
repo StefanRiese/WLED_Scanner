@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
@@ -15,6 +15,8 @@ use socket2::{Domain, Protocol, Socket, Type};
 /// UDP port WLED uses to broadcast node info ("Discover nodes").
 const DISCOVERY_PORT: u16 = 65506;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
+/// WLED broadcasts every 30 s; after three missed broadcasts a device counts as offline.
+const OFFLINE_AFTER: Duration = Duration::from_secs(90);
 
 /// Subset of WLED's `/json/info` response that the scanner displays.
 #[derive(Debug, Default, Deserialize)]
@@ -28,11 +30,46 @@ struct WledInfo {
 }
 
 struct Device {
+    /// Address from the discovery packet; identifies the device.
+    announced_ip: Ipv4Addr,
     name: String,
     ip: String,
     version: String,
     arch: String,
-    uptime: String,
+    /// Uptime reported by the device at `fetched_at`.
+    uptime: u64,
+    fetched_at: Instant,
+    last_seen: Instant,
+}
+
+impl Device {
+    fn update(&mut self, info: WledInfo, now: Instant) {
+        self.ip = if info.ip.is_empty() {
+            self.announced_ip.to_string()
+        } else {
+            info.ip
+        };
+        self.name = info.name;
+        self.version = info.ver;
+        self.arch = info.arch;
+        self.uptime = info.uptime;
+        self.fetched_at = now;
+        self.last_seen = now;
+    }
+
+    fn is_offline(&self, now: Instant) -> bool {
+        now.duration_since(self.last_seen) > OFFLINE_AFTER
+    }
+
+    /// Uptime extrapolated from the last refresh; frozen once the device goes offline.
+    fn current_uptime(&self, now: Instant) -> u64 {
+        let until = if self.is_offline(now) {
+            self.last_seen
+        } else {
+            now
+        };
+        self.uptime + until.saturating_duration_since(self.fetched_at).as_secs()
+    }
 }
 
 enum Event {
@@ -47,8 +84,8 @@ struct App {
     rx: Receiver<Event>,
     ctx: egui::Context,
     devices: Vec<Device>,
-    /// IPs already listed or currently being queried.
-    known: HashSet<Ipv4Addr>,
+    /// IPs whose `/json/info` request is still running.
+    pending: HashSet<Ipv4Addr>,
     /// Bumped on "Clear list" so late HTTP results from before the clear are dropped.
     generation: u64,
     selected: Option<usize>,
@@ -74,7 +111,7 @@ impl App {
             rx,
             ctx,
             devices: Vec::new(),
-            known: HashSet::new(),
+            pending: HashSet::new(),
             generation: 0,
             selected: None,
             status,
@@ -85,7 +122,12 @@ impl App {
         while let Ok(event) = self.rx.try_recv() {
             match event {
                 Event::Announced(ip) => {
-                    if self.known.insert(ip) {
+                    // The broadcast itself proves the device is online.
+                    if let Some(device) = self.device_mut(ip) {
+                        device.last_seen = Instant::now();
+                    }
+                    // Refresh name, version and uptime on every announcement.
+                    if self.pending.insert(ip) {
                         let (tx, ctx, generation) =
                             (self.tx.clone(), self.ctx.clone(), self.generation);
                         thread::spawn(move || {
@@ -96,29 +138,40 @@ impl App {
                     }
                 }
                 Event::Info(generation, _, _) if generation != self.generation => {}
-                Event::Info(_, ip, Some(info)) => self.devices.push(Device {
-                    name: info.name,
-                    // Prefer the IP the device reports, fall back to the announced one.
-                    ip: if info.ip.is_empty() {
-                        ip.to_string()
-                    } else {
-                        info.ip
-                    },
-                    version: info.ver,
-                    arch: info.arch,
-                    uptime: format_uptime(info.uptime),
-                }),
-                // Forget failed lookups so the next announcement retries.
-                Event::Info(_, ip, None) => {
-                    self.known.remove(&ip);
+                Event::Info(_, ip, info) => {
+                    self.pending.remove(&ip);
+                    // A failed lookup keeps the previous data; the next announcement retries.
+                    let Some(info) = info else { continue };
+                    let now = Instant::now();
+                    match self.device_mut(ip) {
+                        Some(device) => device.update(info, now),
+                        None => {
+                            let mut device = Device {
+                                announced_ip: ip,
+                                name: String::new(),
+                                ip: String::new(),
+                                version: String::new(),
+                                arch: String::new(),
+                                uptime: 0,
+                                fetched_at: now,
+                                last_seen: now,
+                            };
+                            device.update(info, now);
+                            self.devices.push(device);
+                        }
+                    }
                 }
             }
         }
     }
 
+    fn device_mut(&mut self, ip: Ipv4Addr) -> Option<&mut Device> {
+        self.devices.iter_mut().find(|d| d.announced_ip == ip)
+    }
+
     fn clear(&mut self) {
         self.devices.clear();
-        self.known.clear();
+        self.pending.clear();
         self.selected = None;
         self.generation += 1;
     }
@@ -133,6 +186,9 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.handle_events();
+        // Keep "Last seen" and uptime ticking without new events.
+        ui.ctx().request_repaint_after(Duration::from_secs(1));
+        let now = Instant::now();
 
         egui::Panel::bottom("buttons").show(ui, |ui| {
             ui.add_space(6.0);
@@ -163,6 +219,7 @@ impl eframe::App for App {
                 .column(Column::auto().at_least(110.0).resizable(true))
                 .column(Column::auto().at_least(80.0).resizable(true))
                 .column(Column::auto().at_least(90.0).resizable(true))
+                .column(Column::auto().at_least(130.0).resizable(true))
                 .column(Column::remainder())
                 .header(22.0, |mut header| {
                     for title in [
@@ -171,6 +228,7 @@ impl eframe::App for App {
                         "Version",
                         "Architecture",
                         "Uptime (dd:hh:mm:ss)",
+                        "Last seen",
                     ] {
                         header.col(|ui| {
                             ui.strong(title);
@@ -182,14 +240,23 @@ impl eframe::App for App {
                         let index = row.index();
                         row.set_selected(self.selected == Some(index));
                         let device = &self.devices[index];
+                        let offline = device.is_offline(now);
+                        let uptime = format_uptime(device.current_uptime(now));
+                        let last_seen = format_last_seen(now.duration_since(device.last_seen));
                         for text in [
                             &device.name,
                             &device.ip,
                             &device.version,
                             &device.arch,
-                            &device.uptime,
+                            &uptime,
+                            &last_seen,
                         ] {
                             row.col(|ui| {
+                                // Grey out devices that stopped announcing themselves.
+                                let mut text = egui::RichText::new(text);
+                                if offline {
+                                    text = text.weak();
+                                }
                                 ui.add(egui::Label::new(text).selectable(false));
                             });
                         }
@@ -270,13 +337,23 @@ fn format_uptime(seconds: u64) -> String {
     )
 }
 
+fn format_last_seen(ago: Duration) -> String {
+    match ago.as_secs() {
+        0..5 => "just now".to_owned(),
+        s @ 5..60 => format!("{s} s ago"),
+        s @ 60..3600 => format!("{} min ago", s / 60),
+        s @ 3600..86_400 => format!("{} h ago", s / 3600),
+        s => format!("{} d ago", s / 86_400),
+    }
+}
+
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("WLED Devices")
             // Wayland takes the icon from the .desktop file whose name matches the app id.
             .with_app_id("wled-scanner")
-            .with_inner_size([720.0, 320.0])
+            .with_inner_size([860.0, 320.0])
             .with_min_inner_size([480.0, 200.0])
             .with_icon(
                 eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
@@ -309,5 +386,44 @@ mod tests {
     fn formats_uptime() {
         assert_eq!(format_uptime(0), "00:00:00:00");
         assert_eq!(format_uptime(90_061), "01:01:01:01");
+    }
+
+    #[test]
+    fn formats_last_seen() {
+        let s = Duration::from_secs;
+        assert_eq!(format_last_seen(s(2)), "just now");
+        assert_eq!(format_last_seen(s(45)), "45 s ago");
+        assert_eq!(format_last_seen(s(150)), "2 min ago");
+        assert_eq!(format_last_seen(s(7200)), "2 h ago");
+        assert_eq!(format_last_seen(s(200_000)), "2 d ago");
+    }
+
+    fn device(fetched_ago: u64, seen_ago: u64, now: Instant) -> Device {
+        Device {
+            announced_ip: Ipv4Addr::LOCALHOST,
+            name: String::new(),
+            ip: String::new(),
+            version: String::new(),
+            arch: String::new(),
+            uptime: 1000,
+            fetched_at: now - Duration::from_secs(fetched_ago),
+            last_seen: now - Duration::from_secs(seen_ago),
+        }
+    }
+
+    #[test]
+    fn uptime_keeps_counting_while_online() {
+        let now = Instant::now();
+        let d = device(20, 20, now);
+        assert!(!d.is_offline(now));
+        assert_eq!(d.current_uptime(now), 1020);
+    }
+
+    #[test]
+    fn uptime_freezes_when_offline() {
+        let now = Instant::now();
+        let d = device(300, 280, now);
+        assert!(d.is_offline(now));
+        assert_eq!(d.current_uptime(now), 1020);
     }
 }
