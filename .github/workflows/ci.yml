@@ -10,10 +10,11 @@ on:
 permissions:
   contents: read
 
-# Cancel superseded runs of the same branch/PR.
+# Cancel superseded runs of the same branch/PR, but let every run on main finish
+# so each commit there gets a complete result (tags are unique and never superseded).
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   CARGO_TERM_COLOR: always
