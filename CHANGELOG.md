@@ -3,6 +3,11 @@
 The section for a version becomes its GitHub release note (see `.github/scripts/release-notes.sh`).
 Add a `## vX.Y.Z – YYYY-MM-DD` section before pushing the tag.
 
+## Unreleased
+
+### What's new
+- **Sortable columns.** Click a column header to sort the list by it; click again to reverse the order. An arrow marks the sorted column. IPs and versions sort by their numbers (10.0.0.9 before 10.0.0.10), and the selected device stays selected when the order changes.
+
 ## v1.2.0 – 2026-10-15
 
 ### What's new

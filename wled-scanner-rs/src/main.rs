@@ -1,6 +1,7 @@
 // Hide the console window on Windows release builds.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -64,6 +65,11 @@ impl Device {
         self.last_seen = now;
     }
 
+    /// The displayed IP as an address, so 10.0.0.9 sorts before 10.0.0.10.
+    fn sort_ip(&self) -> Ipv4Addr {
+        self.ip.parse().unwrap_or(self.announced_ip)
+    }
+
     fn is_offline(&self, now: Instant) -> bool {
         now.duration_since(self.last_seen) > OFFLINE_AFTER
     }
@@ -77,6 +83,69 @@ impl Device {
         };
         self.uptime + until.saturating_duration_since(self.fetched_at).as_secs()
     }
+}
+
+/// Table columns, in display order.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SortColumn {
+    Name,
+    Ip,
+    Version,
+    Arch,
+    Uptime,
+    LastSeen,
+}
+
+const COLUMNS: [(&str, SortColumn); 6] = [
+    ("Name", SortColumn::Name),
+    ("IP", SortColumn::Ip),
+    ("Version", SortColumn::Version),
+    ("Architecture", SortColumn::Arch),
+    ("Uptime (dd:hh:mm:ss)", SortColumn::Uptime),
+    ("Last seen", SortColumn::LastSeen),
+];
+
+/// Ascending order of two devices by `column`. "Last seen" ascending lists the most recent first,
+/// matching the order of the displayed "… ago" values.
+fn compare_devices(column: SortColumn, a: &Device, b: &Device, now: Instant) -> Ordering {
+    match column {
+        SortColumn::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        SortColumn::Ip => a.sort_ip().cmp(&b.sort_ip()),
+        SortColumn::Version => natural_cmp(&a.version, &b.version),
+        SortColumn::Arch => a.arch.to_lowercase().cmp(&b.arch.to_lowercase()),
+        SortColumn::Uptime => a.current_uptime(now).cmp(&b.current_uptime(now)),
+        SortColumn::LastSeen => b.last_seen.cmp(&a.last_seen),
+    }
+}
+
+/// Compares strings with embedded numbers by value, so "0.9.1" sorts before "0.15.0".
+fn natural_cmp(a: &str, b: &str) -> Ordering {
+    let (mut a, mut b) = (a, b);
+    loop {
+        match (a.chars().next(), b.chars().next()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(x), Some(y)) if x.is_ascii_digit() && y.is_ascii_digit() => {
+                let (na, ra) = split_digits(a);
+                let (nb, rb) = split_digits(b);
+                // Compare by length first (leading zeros stripped) so long numbers can't overflow.
+                let (na, nb) = (na.trim_start_matches('0'), nb.trim_start_matches('0'));
+                match na.len().cmp(&nb.len()).then_with(|| na.cmp(nb)) {
+                    Ordering::Equal => (a, b) = (ra, rb),
+                    other => return other,
+                }
+            }
+            (Some(x), Some(y)) => match x.to_ascii_lowercase().cmp(&y.to_ascii_lowercase()) {
+                Ordering::Equal => (a, b) = (&a[x.len_utf8()..], &b[y.len_utf8()..]),
+                other => return other,
+            },
+        }
+    }
+}
+
+fn split_digits(s: &str) -> (&str, &str) {
+    s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()))
 }
 
 enum Event {
@@ -98,7 +167,10 @@ struct App {
     mdns: Option<ServiceDaemon>,
     /// Bumped on "Clear list" so late HTTP results from before the clear are dropped.
     generation: u64,
-    selected: Option<usize>,
+    /// Selected device by its announced IP, so the selection survives re-sorting.
+    selected: Option<Ipv4Addr>,
+    /// Column and direction (`true` = ascending) the table is sorted by; `None` keeps discovery order.
+    sort: Option<(SortColumn, bool)>,
     status: String,
 }
 
@@ -133,6 +205,7 @@ impl App {
             mdns: mdns.ok(),
             generation: 0,
             selected: None,
+            sort: None,
             status,
         }
     }
@@ -221,8 +294,29 @@ impl App {
         self.generation += 1;
     }
 
+    /// Clicking the sorted column flips the direction; another column starts ascending.
+    fn toggle_sort(&mut self, column: SortColumn) {
+        self.sort = match self.sort {
+            Some((current, ascending)) if current == column => Some((column, !ascending)),
+            _ => Some((column, true)),
+        };
+    }
+
+    /// Re-sorted every frame because uptime and "Last seen" change over time.
+    fn sort_devices(&mut self, now: Instant) {
+        if let Some((column, ascending)) = self.sort {
+            self.devices.sort_by(|a, b| {
+                let order = compare_devices(column, a, b, now);
+                if ascending { order } else { order.reverse() }
+            });
+        }
+    }
+
     fn open_selected(&self) {
-        if let Some(device) = self.selected.and_then(|i| self.devices.get(i)) {
+        if let Some(device) = self
+            .selected
+            .and_then(|ip| self.devices.iter().find(|d| d.announced_ip == ip))
+        {
             let _ = open::that_detached(format!("http://{}", device.ip));
         }
     }
@@ -235,6 +329,7 @@ impl eframe::App for App {
         ui.ctx().request_repaint_after(Duration::from_secs(1));
         let now = Instant::now();
         self.poll_devices(now);
+        self.sort_devices(now);
 
         egui::Panel::bottom("buttons").show(ui, |ui| {
             ui.add_space(6.0);
@@ -258,6 +353,7 @@ impl eframe::App for App {
 
         egui::CentralPanel::default().show(ui, |ui| {
             let mut open_requested = false;
+            let mut sort_clicked = None;
             TableBuilder::new(ui)
                 .striped(true)
                 .sense(egui::Sense::click())
@@ -268,24 +364,30 @@ impl eframe::App for App {
                 .column(Column::auto().at_least(130.0).resizable(true))
                 .column(Column::remainder())
                 .header(22.0, |mut header| {
-                    for title in [
-                        "Name",
-                        "IP",
-                        "Version",
-                        "Architecture",
-                        "Uptime (dd:hh:mm:ss)",
-                        "Last seen",
-                    ] {
-                        header.col(|ui| {
-                            ui.strong(title);
+                    for (title, column) in COLUMNS {
+                        let arrow = match self.sort {
+                            Some((sorted, true)) if sorted == column => " ⏶",
+                            Some((sorted, false)) if sorted == column => " ⏷",
+                            _ => "",
+                        };
+                        let (_, response) = header.col(|ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!("{title}{arrow}")).strong(),
+                                )
+                                .selectable(false),
+                            );
                         });
+                        if response.on_hover_text("Click to sort").clicked() {
+                            sort_clicked = Some(column);
+                        }
                     }
                 })
                 .body(|body| {
                     body.rows(20.0, self.devices.len(), |mut row| {
-                        let index = row.index();
-                        row.set_selected(self.selected == Some(index));
-                        let device = &self.devices[index];
+                        let device = &self.devices[row.index()];
+                        let ip = device.announced_ip;
+                        row.set_selected(self.selected == Some(ip));
                         let offline = device.is_offline(now);
                         let uptime = format_uptime(device.current_uptime(now));
                         let last_seen = format_last_seen(now.duration_since(device.last_seen));
@@ -308,14 +410,17 @@ impl eframe::App for App {
                         }
                         let response = row.response();
                         if response.clicked() {
-                            self.selected = Some(index);
+                            self.selected = Some(ip);
                         }
                         if response.double_clicked() {
-                            self.selected = Some(index);
+                            self.selected = Some(ip);
                             open_requested = true;
                         }
                     });
                 });
+            if let Some(column) = sort_clicked {
+                self.toggle_sort(column);
+            }
             if open_requested {
                 self.open_selected();
             }
@@ -507,6 +612,38 @@ mod tests {
             (stale, now - Duration::from_secs(31)),
         ]);
         assert_eq!(due_for_poll(&known, now), vec![stale]);
+    }
+
+    #[test]
+    fn compares_numbers_by_value() {
+        assert_eq!(natural_cmp("0.9.1", "0.15.0"), Ordering::Less);
+        assert_eq!(natural_cmp("0.15.0", "0.15.0-b3"), Ordering::Less);
+        assert_eq!(natural_cmp("0.14.4", "0.14.04"), Ordering::Equal);
+        assert_eq!(natural_cmp("Kitchen 10", "kitchen 2"), Ordering::Greater);
+    }
+
+    #[test]
+    fn sorts_by_ip_numerically() {
+        let now = Instant::now();
+        let mut a = device(0, 0, now);
+        let mut b = device(0, 0, now);
+        a.ip = "10.0.0.10".to_owned();
+        b.ip = "10.0.0.9".to_owned();
+        assert_eq!(
+            compare_devices(SortColumn::Ip, &a, &b, now),
+            Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn sorts_most_recently_seen_first() {
+        let now = Instant::now();
+        let recent = device(0, 5, now);
+        let older = device(0, 60, now);
+        assert_eq!(
+            compare_devices(SortColumn::LastSeen, &recent, &older, now),
+            Ordering::Less
+        );
     }
 
     #[test]

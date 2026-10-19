@@ -14,8 +14,9 @@ The scanner finds devices in two ways:
 
 Each device is queried via `http://<ip>/json/info` every 30 seconds; the list shows its name,
 IP, version, architecture, uptime and when it was last seen. Devices that haven't answered or
-announced themselves for more than 90 seconds stay in the list, greyed out. Select a device
-and click **Open in browser** (or double-click it) to open its web UI.
+announced themselves for more than 90 seconds stay in the list, greyed out. Click a column
+header to sort by it (click again to reverse). Select a device and click **Open in browser**
+(or double-click it) to open its web UI.
 
 > Your firewall must allow incoming UDP on ports 5353 (mDNS) and 65506. On macOS 15 and later,
 > allow the "local network" access the app asks for on first start.
